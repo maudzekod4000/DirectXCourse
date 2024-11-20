@@ -118,6 +118,100 @@ ID3D12GraphicsCommandList* createGraphicsCommandList(ID3D12Device* device,
 	return commandList;
 }
 
+ID3D12Resource* createTextureResource(ID3D12Device* d) {
+	D3D12_RESOURCE_DESC desc;
+	desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+	desc.Width = 640;
+	desc.Height = 480;
+	desc.DepthOrArraySize = 1;
+	desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+	desc.SampleDesc.Count = 1; // AA
+	desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+
+	D3D12_HEAP_PROPERTIES heapProps;
+	heapProps.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+	ID3D12Resource* resource;
+
+	HRESULT res = d->CreateCommittedResource(
+		&heapProps,
+		D3D12_HEAP_FLAG_NONE,
+		&desc,
+		D3D12_RESOURCE_STATE_RENDER_TARGET,
+		nullptr,
+		IID_PPV_ARGS(&resource)
+	);
+
+	if (FAILED(res)) {
+		return nullptr;
+	}
+	return resource;
+}
+
+ID3D12Resource* createReadbackBuffer(ID3D12Device* d, ID3D12Resource* source) {
+	D3D12_RESOURCE_DESC readbackBufferDesc = {};
+	readbackBufferDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+	// Outputs
+	D3D12_PLACED_SUBRESOURCE_FOOTPRINT layouts[1] = {};
+	UINT numRows[1] = {};
+	UINT64 rowSizesInBytes[1] = {};
+	UINT64 totalBytes = 0;
+
+	// Call GetCopyableFootprints
+	d->GetCopyableFootprints(
+		&source->GetDesc(),  // Resource description
+		0,              // First subresource
+		1,              // Number of subresources
+		0,              // Base offset
+		layouts,        // Subresource layouts
+		numRows,        // Number of rows
+		rowSizesInBytes,// Row sizes
+		&totalBytes     // Total size
+	);
+
+	// Retrieve the width
+	UINT64 width = layouts[0].Footprint.Width;
+	readbackBufferDesc.Width = width;
+	// TODO: Continue onward.
+	readbackBufferDesc.Height = 1;
+	readbackBufferDesc.Format = DXGI_FORMAT_UNKNOWN;
+	readbackBufferDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+	D3D12_HEAP_PROPERTIES heapProps;
+	heapProps.Type = D3D12_HEAP_TYPE_READBACK;
+
+	ID3D12Resource* resource;
+
+	HRESULT res = d->CreateCommittedResource(
+		&heapProps,
+		D3D12_HEAP_FLAG_NONE,
+		&readbackBufferDesc,
+		D3D12_RESOURCE_STATE_COPY_SOURCE,
+		nullptr,
+		IID_PPV_ARGS(&resource)
+	);
+
+	if (FAILED(res)) {
+		return nullptr;
+	}
+	return resource;
+}
+
+ID3D12DescriptorHeap* createDescriptorHeap(ID3D12Device* d) {
+	D3D12_DESCRIPTOR_HEAP_DESC descriptorDesc;
+	descriptorDesc.NumDescriptors = 1;
+	descriptorDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+	descriptorDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+
+	ID3D12DescriptorHeap* heap;
+	HRESULT res = d->CreateDescriptorHeap(&descriptorDesc, IID_PPV_ARGS(&heap));
+
+	if (FAILED(res)) {
+		return nullptr;
+	}
+	return heap;
+}
+
 int main() {
 	IDXGIFactory4* dxgiFactory;
 	HRESULT hr = CreateDXGIFactory(IID_PPV_ARGS(&dxgiFactory));
@@ -178,6 +272,84 @@ int main() {
 	std::cout << "Graphics command list created." << std::endl;
 
 	// Do some work
+	ID3D12Resource* renderTarget = createTextureResource(d12Device);
+
+	if (!renderTarget) {
+		std::cerr << "Failed to create render target resource" << std::endl;
+		return 1;
+	}
+
+	ID3D12DescriptorHeap* descriptorHeap = createDescriptorHeap(d12Device);
+
+	if (!descriptorHeap) {
+		std::cerr << "Failed to create descriptor heap to store all the descriptors to resources" << std::endl;
+		return 1;
+	}
+
+	D3D12_CPU_DESCRIPTOR_HANDLE renderTargetViewHandle = descriptorHeap->GetCPUDescriptorHandleForHeapStart();
+
+	d12Device->CreateRenderTargetView(renderTarget, nullptr, renderTargetViewHandle);
+
+	// Commands
+	// 1. Set the render target on which the GPU will work
+	commandList->OMSetRenderTargets(1, &renderTargetViewHandle, FALSE, nullptr);
+
+	// 2. Set the clear color
+	FLOAT clearColor[4] = { 1.0f, 0.0f, 0.0f, 1.0f };
+	commandList->ClearRenderTargetView(renderTargetViewHandle, clearColor, 0, nullptr);
+
+	ID3D12Resource* readbackBuffer = createReadbackBuffer(d12Device, renderTarget);
+
+	if (!readbackBuffer) {
+		std::cerr << "Failed to create readback buffer" << std::endl;
+		return 1;
+	}
+
+	D3D12_RESOURCE_BARRIER barrier = {};
+	barrier.Transition.pResource = renderTarget;
+	barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+	barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+
+	commandList->ResourceBarrier(1, &barrier);
+
+	D3D12_TEXTURE_COPY_LOCATION sourceLoc;
+	sourceLoc.pResource = renderTarget;
+	sourceLoc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+	sourceLoc.SubresourceIndex = 0;
+
+	D3D12_TEXTURE_COPY_LOCATION destLoc;
+	D3D12_PLACED_SUBRESOURCE_FOOTPRINT layouts[1] = {};
+	UINT numRows[1] = {};
+	UINT64 rowSizesInBytes[1] = {};
+	UINT64 totalBytes = 0;
+
+	// Call GetCopyableFootprints
+	d12Device->GetCopyableFootprints(
+		&renderTarget->GetDesc(),  // Resource description
+		0,              // First subresource
+		1,              // Number of subresources
+		0,              // Base offset
+		layouts,        // Subresource layouts
+		numRows,        // Number of rows
+		rowSizesInBytes,// Row sizes
+		&totalBytes     // Total size
+	);
+	destLoc.PlacedFootprint = layouts[0];
+	destLoc.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+
+	commandList->CopyTextureRegion(&destLoc, 0, 0, 0, &sourceLoc, nullptr);
+
+	D3D12_RESOURCE_BARRIER barrierBack = {};
+	barrierBack.Transition.pResource = renderTarget;
+	barrierBack.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+	barrierBack.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+
+	commandList->ResourceBarrier(1, &barrierBack);
+
+	commandList->Close();
+
+	ID3D12CommandList* commandLists[] = { commandList };
+	commandQ->ExecuteCommandLists(_countof(commandLists), commandLists);
 
 	d12Device->Release();
 	commandQ->Release();
